@@ -1,0 +1,111 @@
+import os, time
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.ml.fpm import FPGrowth
+
+DS3_ROOT = "/mnt/d/DS3"
+TMP_DIR = f"{DS3_ROOT}/tmp"
+
+def run_one(spark, parquet_path: str, minSup: float, max_k: int, num_parts: int | None):
+    df = spark.read.parquet(parquet_path)
+
+    # Expect: column "items" is array<string>
+    # (your prepare scripts already do this)
+    if "items" not in df.columns:
+        raise RuntimeError(f"'items' column not found in {parquet_path}. Columns={df.columns}")
+
+    m = df.count()  # transactions
+    minCount = int((minSup * m) + 1e-9)
+
+    fp = FPGrowth(
+        itemsCol="items",
+        minSupport=minSup,
+        minConfidence=0.0,         # we only need frequent itemsets
+        numPartitions=num_parts if num_parts else None
+    )
+
+    t0 = time.perf_counter()
+    model = fp.fit(df)
+    # Restrict to k<=max_k to match DSSS kmax=2
+    freq = model.freqItemsets.withColumn("k", F.size("items")).filter(F.col("k") <= max_k)
+
+    # Trigger computation and count results
+    freq_count = freq.count()
+
+    # Top10
+    top10 = freq.orderBy(F.desc("freq")).limit(10).collect()
+
+    t1 = time.perf_counter()
+    return {
+        "m_rows": m,
+        "minSup": minSup,
+        "minCount": minCount,
+        "freq_itemsets_k<=2": freq_count,
+        "time_sec": (t1 - t0),
+        "top10": top10
+    }
+
+def main():
+    dataset = os.environ.get("DATASET", "").strip().lower()
+    if dataset not in ("otto", "higgs"):
+        raise SystemExit("Set DATASET=otto or DATASET=higgs")
+
+    # Input parquet paths (match your tree)
+    if dataset == "otto":
+        PARQUET = f"{DS3_ROOT}/data/processed/otto_transactions.parquet"
+        OUTCSV  = f"{DS3_ROOT}/results/otto_fpgrowth_k2_runtime.csv"
+        APP     = "FP-Growth Otto k<=2 sweep"
+    else:
+        PARQUET = f"{DS3_ROOT}/data/processed/higgs_transactions.parquet"
+        OUTCSV  = f"{DS3_ROOT}/results/higgs_fpgrowth_k2_runtime.csv"
+        APP     = "FP-Growth Higgs k<=2 sweep"
+
+    # Use same supports as paper section (0.1%..0.5%)
+    supports = [0.001, 0.002, 0.003, 0.004, 0.005]
+    max_k = 2
+
+    # Optional: control Spark local cores like local[16]
+    master = os.environ.get("SPARK_MASTER", "local[*]")
+
+    spark = (SparkSession.builder
+             .appName(APP)
+             .master(master)
+             .config("spark.sql.shuffle.partitions", "16")
+             .config("spark.local.dir", TMP_DIR)
+             .getOrCreate())
+    spark.sparkContext.setLogLevel("WARN")
+
+    num_parts_env = os.environ.get("FP_PARTITIONS", "").strip()
+    num_parts = int(num_parts_env) if num_parts_env else None
+
+    # Write CSV header
+    os.makedirs(os.path.dirname(OUTCSV), exist_ok=True)
+    with open(OUTCSV, "w") as f:
+        f.write("minSup,m_rows,minCount,freq_itemsets_k<=2,time_sec\n")
+
+    log_path = f"{DS3_ROOT}/logs/{dataset}_fpgrowth_k2_run.log"
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
+    with open(log_path, "w") as log:
+        log.write(f"[INFO] dataset={dataset} parquet={PARQUET} master={master} FP_PARTITIONS={num_parts}\n")
+
+        for s in supports:
+            res = run_one(spark, PARQUET, s, max_k=max_k, num_parts=num_parts)
+
+            with open(OUTCSV, "a") as f:
+                f.write(f"{res['minSup']},{res['m_rows']},{res['minCount']},{res['freq_itemsets_k<=2']},{res['time_sec']:.6f}\n")
+
+            log.write(f"[INFO] {dataset}_fpgrowth_sup_{s}: m={res['m_rows']}, minSup={s}, minCount={res['minCount']}, kmax={max_k}\n")
+            log.write(f"[FPGROWTH] {dataset}_fpgrowth_sup_{s}: frequent_itemsets(k<=2)={res['freq_itemsets_k<=2']}, time_sec={res['time_sec']:.3f}\n")
+            log.write("[FPGROWTH] top10 (itemset -> count):\n")
+            for r in res["top10"]:
+                log.write(f"   {tuple(r['items'])} -> {r['freq']}\n")
+
+            print(f"[DONE] minSup={s} freq(k<=2)={res['freq_itemsets_k<=2']} time={res['time_sec']:.3f}s")
+
+    spark.stop()
+    print(f"[SAVED] {OUTCSV}")
+    print(f"[LOG]   {log_path}")
+
+if __name__ == "__main__":
+    main()
